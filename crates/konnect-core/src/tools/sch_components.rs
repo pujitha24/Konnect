@@ -2478,6 +2478,24 @@ impl PlacementRefusal {
     }
 }
 
+/// The `(unit N)` of one placed symbol's instance block, ignoring any text
+/// inside a quoted string: a property value may itself contain `(unit `.
+fn placed_unit_of_block(block: &str) -> Option<u32> {
+    let mut from = 0;
+    while let Some(rel) = block[from..].find(['"', '(']) {
+        let at = from + rel;
+        if block.as_bytes()[at] == b'"' {
+            from = closing_quote(block, at + 1)? + 1;
+        } else if block[at..].starts_with("(unit ") {
+            let value = &block[at + "(unit ".len()..];
+            return value[..value.find(')')?].trim().parse().ok();
+        } else {
+            from = at + 1;
+        }
+    }
+    None
+}
+
 fn set_property_placement(
     content: &str,
     reference: &str,
@@ -2499,15 +2517,11 @@ fn set_property_placement(
     for (start, end) in blocks {
         let block = &content[start..end];
         if let Some(wanted) = only_unit {
-            let unit = block
-                .find("(unit ")
-                .and_then(|rel| {
-                    let from = start + rel + "(unit ".len();
-                    content[from..end]
-                        .find(')')
-                        .and_then(|to| content[from..from + to].trim().parse::<u32>().ok())
-                })
-                .unwrap_or(1);
+            let unit = placed_unit_of_block(block).ok_or_else(|| {
+                PlacementRefusal::MalformedFile(format!(
+                    "'{reference}' has a placed unit whose (unit …) cannot be read"
+                ))
+            })?;
             if unit != wanted {
                 continue;
             }
@@ -2849,6 +2863,9 @@ async fn handle_edit_schematic_component(
                     },
                 }
             }
+            // KiCad re-saves a rotation modulo 360 (450 becomes 90), so write
+            // and compare the normalised value, as the symbol-rotate path does.
+            placement.rotation = placement.rotation.map(|r| r.rem_euclid(360.0));
             match spec.get("hide") {
                 None | Some(serde_json::Value::Null) => {}
                 Some(value) => match value.as_bool() {
@@ -2893,10 +2910,15 @@ async fn handle_edit_schematic_component(
                 // found to be broken: the refusal would be reported while the
                 // write went ahead anyway.
                 Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
-                    return Ok(CallToolResult::error(format!(
-                        "No fields were updated on '{reference}': {name}: {}",
-                        refusal.reason()
-                    )))
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::Conflict {
+                            paths: vec![sch_path.display().to_string()],
+                        },
+                        format!(
+                            "No fields were updated on '{reference}': {name}: {}",
+                            refusal.reason()
+                        ),
+                    ))
                 }
                 Err(refusal) => errors.push(format!("{name}: {}", refusal.reason())),
             }
@@ -7608,6 +7630,49 @@ mod multi_unit_component_tests {
         );
     }
 
+    /// KiCad re-saves a rotation modulo 360, so the file must carry the
+    /// normalised value and the response must agree with it.
+    #[tokio::test]
+    async fn field_placement_normalises_rotation() {
+        let (_directory, path) = eeschema_fixture();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "field_placements": { "Value": { "rotation": 450.0 }, "Footprint": { "rotation": -90.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(at 157.48 85.09 90)"),
+            "450 is written as 90"
+        );
+        assert!(
+            !after.contains(" 450)"),
+            "the raw rotation must not be written"
+        );
+        assert!(after.contains(" 270)"), "-90 is written as 270");
+    }
+
+    /// A property value that contains `(unit ` must not be read as the
+    /// symbol's unit, and an unreadable unit is refused rather than read as 1.
+    #[test]
+    fn placed_unit_of_block_reads_only_the_symbols_own_unit() {
+        assert_eq!(
+            placed_unit_of_block(r#"(symbol (property "N" "a (unit 9)") (unit 2))"#),
+            Some(2)
+        );
+        assert_eq!(
+            placed_unit_of_block(r#"(symbol (property "N" "(unit 9)"))"#),
+            None
+        );
+        assert_eq!(placed_unit_of_block("(symbol (unit x))"), None);
+    }
+
     /// Removing the hide token must not take whatever shares its line. Files
     /// are not all written one node per line — this fixture is deliberately
     /// not KiCad's own layout, because the hazard only exists in layouts KiCad
@@ -7725,6 +7790,7 @@ mod multi_unit_component_tests {
         .unwrap();
 
         assert!(result.is_error, "{result:?}");
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
         // Assert the reason, not merely that something failed: this handler
         // has several ways to error, and a test that accepts any of them
         // passes with the strict parse gone.
