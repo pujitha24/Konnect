@@ -13,8 +13,8 @@ use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::live_board::{self, LiveBoard};
 use crate::tools::{
-    get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified, ToolContext,
-    ToolDef,
+    get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified,
+    BoardEditorAbsence, ToolContext, ToolDef,
 };
 use konnect_ipc::builders;
 use konnect_sexp::{
@@ -291,16 +291,28 @@ where
             LiveBoard::Uncertain(message) => {
                 BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
             }
-            // An endpoint that served no board is mapped exactly as a
-            // rejection, which is what it was before those cases had names —
-            // `observed_live` and `absence` deliberately unread here. Whether
-            // a write should instead treat a proven-absent editor as
-            // permission is #577's question, not this one's.
-            LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
-                BoardWrite::Refused(CallToolResult::error(format!(
-                    "KiCAD rejected the {what} over IPC: {message}. \
+            LiveBoard::Rejected(message) => BoardWrite::Refused(CallToolResult::error(format!(
+                "KiCAD rejected the {what} over IPC: {message}. \
                  The board file was not modified — KiCAD is reachable and may hold this \
                  board open, so editing the file directly could be silently overwritten."
+            ))),
+            // The refusal is unchanged — whether a proven-absent editor should
+            // permit the write is #577's question — but the sentence must not
+            // claim KiCad may hold a board it has just said it serves none of.
+            LiveBoard::Unserved { absence, .. } => {
+                let next = match absence {
+                    BoardEditorAbsence::NoPcbEditor => {
+                        "Open this board in the PCB Editor and retry."
+                    }
+                    BoardEditorAbsence::OpenDocumentsUnimplemented => {
+                        "Open this board in the PCB Editor of a KiCad that supports the \
+                         open-documents command, and retry."
+                    }
+                };
+                BoardWrite::Refused(CallToolResult::error(format!(
+                    "Cannot apply the {what} over IPC: KiCad is running but {}. \
+                 The board file was not modified. {next}",
+                    absence.observed()
                 )))
             }
             LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
@@ -3671,6 +3683,14 @@ mod board_session_safety_tests {
                 text.contains("The board file was not modified"),
                 "{status:?}: {text}"
             );
+            assert!(!text.contains("may hold this board"), "{status:?}: {text}");
+            assert!(
+                text.contains("Open this board in the PCB Editor"),
+                "{status:?}: {text}"
+            );
+            if status == kiapi::common::ApiStatusCode::AsUnhandled {
+                assert!(text.contains("no PCB editor"), "{status:?}: {text}");
+            }
             assert_eq!(std::fs::read(&board).unwrap(), before, "{status:?}");
         }
     }
