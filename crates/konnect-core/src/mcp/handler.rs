@@ -1648,9 +1648,23 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
             return error;
         };
 
-        alternatives
+        // A branch that rejects a discriminator `const` (e.g. `type`) on the
+        // instance itself was not the one the caller aimed at; report the
+        // branch whose discriminator matched when there is one.
+        let depth = error.instance_path().as_str().matches('/').count();
+        let rejects_discriminator = |errors: &Vec<jsonschema::ValidationError<'_>>| {
+            errors.iter().any(|candidate| {
+                matches!(candidate.kind(), ValidationErrorKind::Constant { .. })
+                    && candidate.instance_path().as_str().matches('/').count() == depth + 1
+            })
+        };
+        let targeted = alternatives
             .iter()
+            .filter(|errors| !rejects_discriminator(errors));
+
+        targeted
             .min_by_key(|errors| errors.len())
+            .or_else(|| alternatives.iter().min_by_key(|errors| errors.len()))
             .and_then(|errors| {
                 errors
                     .iter()
@@ -1942,6 +1956,37 @@ mod schema_validation_dispatch_tests {
             "get_recent_calls",
             json!({"limit": "many"}),
             "limit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_oneof_mismatch_is_reported_against_the_branch_its_type_selects() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("socket.kicad_mod");
+        std::fs::write(
+            &footprint,
+            include_str!("../../tests/fixtures/socket_kicad10.kicad_mod"),
+        )
+        .unwrap();
+
+        // A rect without `fill` is told about `fill`, not that "line" was expected.
+        assert_invalid_field(
+            &handler,
+            "set_footprint_graphics",
+            json!({
+                "footprint_path": footprint.display().to_string(),
+                "selector": {"layer": "F.SilkS"},
+                "mode": "append",
+                "graphics": [{
+                    "type": "rect",
+                    "start": {"x": 0.0, "y": 0.0},
+                    "end": {"x": 1.0, "y": 1.0},
+                    "stroke_width_mm": 0.2
+                }]
+            }),
+            "graphics[0].fill",
         )
         .await;
     }
